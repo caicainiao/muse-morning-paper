@@ -20,24 +20,34 @@ if not api_key:
     sys.exit(1)
 
 def call_gemini(prompt):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "tools": [{"googleSearch": {}}],
-        "generationConfig": {
-            "temperature": 0.25
+    # 使用 Google 官方推荐的最新主力模型 gemini-3.8-flash
+    models = ["gemini-3.8-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    last_err = None
+
+    for m in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "tools": [{"googleSearch": {}}],
+            "generationConfig": {
+                "temperature": 0.2
+            }
         }
-    }
-    headers = {"Content-Type": "application/json"}
-    resp = requests.post(url, headers=headers, json=payload, timeout=120)
-    if resp.status_code != 200:
-        raise Exception(f"Gemini API 失败 ({resp.status_code}): {resp.text}")
-    data = resp.json()
-    try:
-        parts = data["candidates"][0]["content"]["parts"]
-        return "".join([p.get("text", "") for p in parts])
-    except Exception as e:
-        raise Exception(f"解析 Gemini 数据失败: {e}\n{data}")
+        headers = {"Content-Type": "application/json"}
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=120)
+            if resp.status_code == 200:
+                data = resp.json()
+                parts = data["candidates"][0]["content"]["parts"]
+                return "".join([p.get("text", "") for p in parts])
+            else:
+                last_err = f"{m} ({resp.status_code}): {resp.text}"
+                print(f"尝试模型 {m} 遇到问题，尝试备用模型...")
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    raise Exception(f"所有 Gemini 模型调用均失败！错误详情：\n{last_err}")
 
 # 清洗 Meta 重定向链接与 XML 特殊符号
 def clean_xml_and_urls(text):
@@ -55,9 +65,7 @@ def clean_xml_and_urls(text):
     text = re.sub(r'&(?!(amp|lt|gt|quot|apos);)', '&amp;', text)
     return text
 
-# 将原始文本/Markdown 精准转换为水墨风卡片 HTML
 def format_to_html(raw_text):
-    # 去除大模型偶尔输出的 ``` 代码块标记
     raw_text = re.sub(r'^```(html|markdown)?\s*', '', raw_text.strip(), flags=re.MULTILINE)
     raw_text = re.sub(r'```$', '', raw_text.strip(), flags=re.MULTILINE)
 
@@ -70,7 +78,6 @@ def format_to_html(raw_text):
         if not l:
             continue
 
-        # 标题级别转换
         if l.startswith('# '):
             html_lines.append(f'<h2>{l[2:]}</h2>')
             continue
@@ -81,17 +88,14 @@ def format_to_html(raw_text):
             html_lines.append(f'<h4>{l[4:]}</h4>')
             continue
 
-        # 识别主标题
         if "晨报 ·" in l and ("<h2>" not in l):
             html_lines.append(f'<h2>{l}</h2>')
             continue
 
-        # 识别导读引用框
         if l.startswith("今日一句话：") or l.startswith("来源："):
             html_lines.append(f'<div class="meta-box"><p>{l}</p></div>')
             continue
 
-        # 识别版块大类
         if re.match(r'^[1-9]\.\s+', l):
             if in_card:
                 html_lines.append('</div>')
@@ -99,16 +103,12 @@ def format_to_html(raw_text):
             html_lines.append(f'<div class="section-header">{l}</div>')
             continue
 
-        # 识别具体新闻条目开头 -> 包裹卡片
         if any(keyword in l for keyword in ["摘要：", "为什么值得看：", "点数：", "链接："]):
-            # Markdown 链接转 HTML 标签并清洗
             l = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'<a href="\2">\1</a>', l)
-            # Markdown 加粗转换
             l = re.sub(r'\*\*([^\*]+)\*\*', r'<strong>\1</strong>', l)
             html_lines.append(f'<p class="item-field">{l}</p>')
             continue
 
-        # 识别子版块标题（官方博客、开源社区、口径说明等）
         if any(h in l for h in ["模型官方博客速览", "开源与社区速览", "口径说明", "和你相关的"]):
             if in_card:
                 html_lines.append('</div>')
@@ -116,7 +116,6 @@ def format_to_html(raw_text):
             html_lines.append(f'<div class="sub-header">{l}</div>')
             continue
 
-        # 默认段落
         l = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'<a href="\2">\1</a>', l)
         l = re.sub(r'\*\*([^\*]+)\*\*', r'<strong>\1</strong>', l)
         html_lines.append(f'<p>{l}</p>')
@@ -132,7 +131,7 @@ prompt_building = f"""
 今天是 {date_str}（{weekday_str}）。请利用实时 Google 搜索，严格按照以下口径检索并撰写过去 24 小时内的《智能建筑资讯晨报》：
 
 覆盖范围：IBMS、综合能源管理、建筑相关 AI 与预防性维护策略/引擎、戴森大奖等建筑边缘创新。
-必须严格按以下结构输出，严谨核实每个条目的发布日期、技术细节和节能数据，杜绝泛泛而谈：
+必须严格按以下结构输出，严谨核实发布日期、技术细节和节能数据：
 
 智能建筑资讯晨报 · {date_str}（{weekday_str}）
 来源：过去约 24 小时公开资讯，覆盖 IBMS、综合能源管理、相关 AI 与预防性维护策略/引擎。
@@ -180,7 +179,7 @@ AI 晨报 · {date_str}（{weekday_str}）
 链接：...
 
 模型官方博客速览
-（分别整理 OpenAI、Anthropic、Google、开源社区等大厂官方博客的最新更新，若某大厂无更新简要说明）
+（分别整理 OpenAI、Anthropic、Google、开源社区等大厂官方博客的最新更新，若无更新简要说明）
 
 开源与社区速览
 （整理 2 个当前 GitHub Trending 上的顶级开源项目，标注项目定位、Star 数、开源协议、为什么值得看及链接）
@@ -190,7 +189,6 @@ AI 晨报 · {date_str}（{weekday_str}）
 raw_ai = call_gemini(prompt_ai)
 content_ai = format_to_html(raw_ai)
 
-# 专属水墨屏与霞鹜文楷排版 CSS
 CSS_STYLE = """
 @charset "utf-8";
 body {
@@ -275,7 +273,6 @@ epub_file = "output/DailyNews.epub"
 print(f"正在制作精装 EPUB: {epub_file} ...")
 with zipfile.ZipFile(epub_file, 'w', zipfile.ZIP_DEFLATED) as z:
     z.writestr('mimetype', 'application/epub+zip', compress_type=zipfile.ZIP_STORED)
-    
     z.writestr('META-INF/container.xml', '''<?xml version="1.0" encoding="UTF-8"?>
 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
   <rootfiles>
