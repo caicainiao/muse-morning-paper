@@ -4,7 +4,9 @@ import sys
 import re
 import urllib.parse
 import zipfile
-import requests
+import imaplib
+import email
+from email.header import decode_header
 from datetime import datetime, timezone, timedelta
 
 # 获取北京时间 (UTC+8)
@@ -14,201 +16,177 @@ date_str = now.strftime("%Y-%m-%d")
 weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 weekday_str = weekdays[now.weekday()]
 
-api_key = os.environ.get("GEMINI_API_KEY")
-if not api_key:
-    print("错误：未找到 GEMINI_API_KEY 环境变量！")
+gmail_user = os.environ.get("GMAIL_USER")
+gmail_pwd = os.environ.get("GMAIL_APP_PASSWORD")
+
+if not gmail_user or not gmail_pwd:
+    print("错误：未找到 GMAIL_USER 或 GMAIL_APP_PASSWORD 环境变量！")
     sys.exit(1)
 
-# 第一步：直接向 Google 查询当前账号允许使用的所有模型
-print("正在自动查询 Google AI Studio 允许调用的模型列表...")
-list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-list_resp = requests.get(list_url, timeout=30)
+# 清理应用密码里的空格
+gmail_pwd = gmail_pwd.replace(" ", "")
 
-if list_resp.status_code != 200:
-    print(f"【API Key 验证失败】({list_resp.status_code}): {list_resp.text}")
+print(f"正在连接 Gmail ({gmail_user}) 获取最新晨报邮件...")
+mail = imaplib.IMAP4_SSL("imap.gmail.com")
+try:
+    mail.login(gmail_user, gmail_pwd)
+except Exception as e:
+    print(f"Gmail 登录失败，请检查密码配置: {e}")
     sys.exit(1)
 
-available_models = []
-for m in list_resp.json().get("models", []):
-    methods = m.get("supportedGenerationMethods", [])
-    if "generateContent" in methods:
-        available_models.append(m.get("name"))
+mail.select("INBOX")
 
-print(f"【成功获取可用模型】共 {len(available_models)} 个模型:")
-for m in available_models[:8]:
-    print("  -", m)
+# 获取最近的 20 封邮件
+status, messages = mail.search(None, "ALL")
+mail_ids = messages[0].split()
+recent_ids = mail_ids[-20:]
+recent_ids.reverse()
 
-# 优选包含 flash 的最新模型
-target_model = None
-for pref in ["models/gemini-3.8-flash", "models/gemini-2.0-flash", "models/gemini-flash-latest"]:
-    if pref in available_models:
-        target_model = pref
+content_building_raw = ""
+content_ai_raw = ""
+
+def decode_mime_words(s):
+    if not s:
+        return ""
+    decoded_fragments = decode_header(s)
+    res = []
+    for frag, encoding in decoded_fragments:
+        if isinstance(frag, bytes):
+            res.append(frag.decode(encoding or "utf-8", errors="replace"))
+        else:
+            res.append(str(frag))
+    return "".join(res)
+
+def extract_body(msg):
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            cdispo = str(part.get('Content-Disposition'))
+            # 优先提取 text/plain 纯文本
+            if ctype == 'text/plain' and 'attachment' not in cdispo:
+                payload = part.get_payload(decode=True)
+                if payload:
+                    return payload.decode('utf-8', errors='replace')
+        # 如果没有 text/plain，提取 html
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            cdispo = str(part.get('Content-Disposition'))
+            if ctype == 'text/html' and 'attachment' not in cdispo:
+                payload = part.get_payload(decode=True)
+                if payload:
+                    return payload.decode('utf-8', errors='replace')
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            return payload.decode('utf-8', errors='replace')
+    return ""
+
+for mid in recent_ids:
+    status, data = mail.fetch(mid, "(RFC822)")
+    for response_part in data:
+        if isinstance(response_part, tuple):
+            msg = email.message_from_bytes(response_part[1])
+            subject = decode_mime_words(msg.get("Subject", ""))
+            body = extract_body(msg)
+
+            # 严格认准 [MUSE] 标识与对应专栏
+            if "[MUSE]" in subject and "智能建筑资讯晨报" in subject and not content_building_raw:
+                print(f"成功命中【智能建筑资讯晨报】邮件 (主题: {subject})")
+                content_building_raw = body
+            if "[MUSE]" in subject and "AI 晨报" in subject and not content_ai_raw:
+                print(f"成功命中【AI 晨报】邮件 (主题: {subject})")
+                content_ai_raw = body
+
+    if content_building_raw and content_ai_raw:
         break
 
-if not target_model and available_models:
-    target_model = available_models[0]
+mail.close()
+mail.logout()
 
-print(f"\n>>> 自动锁定目标模型: 【{target_model}】 <<<")
+if not content_building_raw:
+    print("未在收件箱最近邮件中找到【智能建筑资讯晨报】，使用默认提示排版...")
+    content_building_raw = f"# 智能建筑资讯晨报 · {date_str}（{weekday_str}）\n今日未检索到该邮件。"
 
-def call_gemini(prompt):
-    url = f"https://generativelanguage.googleapis.com/v1beta/{target_model}:generateContent?key={api_key}"
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "tools": [{"google_search": {}}],
-        "generationConfig": {
-            "temperature": 0.2
-        }
-    }
-    headers = {"Content-Type": "application/json"}
-    resp = requests.post(url, headers=headers, json=payload, timeout=120)
-    
-    # 如果带 search tool 失败，降级尝试无 search 纯模型，并打印原因
-    if resp.status_code != 200:
-        print(f"带联网搜索调用失败 ({resp.status_code}): {resp.text}")
-        print("尝试降级调用 (不带 tools)...")
-        payload.pop("tools", None)
-        resp = requests.post(url, headers=headers, json=payload, timeout=120)
-        if resp.status_code != 200:
-            raise Exception(f"模型调用失败 ({resp.status_code}): {resp.text}")
+if not content_ai_raw:
+    print("未在收件箱最近邮件中找到【AI 晨报】，使用默认提示排版...")
+    content_ai_raw = f"# AI 晨报 · {date_str}（{weekday_str}）\n今日未检索到该邮件。"
 
-    data = resp.json()
-    parts = data["candidates"][0]["content"]["parts"]
-    return "".join([p.get("text", "") for p in parts])
-
+# 清理 XML 特殊符号与链接
 def clean_xml_and_urls(text):
-    def unwrap_meta(match):
-        full_url = match.group(1)
-        if "l.meta.ai/?u=" in full_url:
-            parsed = urllib.parse.urlparse(full_url)
-            qs = urllib.parse.parse_qs(parsed.query)
-            if 'u' in qs:
-                return f'href="{qs["u"][0]}"'
-        return f'href="{full_url}"'
-
-    text = re.sub(r'href="([^"]+)"', unwrap_meta, text)
+    text = re.sub(r'https?://l\.meta\.ai/\?u=([^&]+)&amp;[^"\s\)]+', lambda m: urllib.parse.unquote(m.group(1)), text)
+    text = re.sub(r'https?://l\.meta\.ai/\?u=([^&]+)&[^"\s\)]+', lambda m: urllib.parse.unquote(m.group(1)), text)
+    # 转义 &
     text = re.sub(r'&(?!(amp|lt|gt|quot|apos);)', '&amp;', text)
     return text
 
+# 针对 Muse 真实邮件格式的精准转换器
 def format_to_html(raw_text):
-    raw_text = re.sub(r'^```(html|markdown)?\s*', '', raw_text.strip(), flags=re.MULTILINE)
-    raw_text = re.sub(r'```$', '', raw_text.strip(), flags=re.MULTILINE)
-
+    # 去除可能存在的 HTML 标签
+    raw_text = re.sub(r'<[^>]+>', '', raw_text)
     lines = raw_text.split('\n')
     html_lines = []
-    in_card = False
+    in_meta_box = False
 
     for line in lines:
         l = line.strip()
         if not l:
             continue
 
+        # 匹配大标题: # 智能建筑资讯晨报·2026-11-06（星期五）
         if l.startswith('# '):
             html_lines.append(f'<h2>{l[2:]}</h2>')
             continue
-        elif l.startswith('## '):
-            html_lines.append(f'<h3>{l[3:]}</h3>')
+
+        # 匹配导读框
+        if l.startswith('来源:') or l.startswith('来源：'):
+            html_lines.append('<div class="meta-box">')
+            html_lines.append(f'<p><strong>来源：</strong>{l[3:].strip()}</p>')
+            in_meta_box = True
             continue
-        elif l.startswith('### '):
-            html_lines.append(f'<h4>{l[4:]}</h4>')
+        if (l.startswith('今日一句话:') or l.startswith('今日一句话：')) and in_meta_box:
+            html_lines.append(f'<p><strong>今日一句话：</strong>{l[6:].strip()}</p>')
+            html_lines.append('</div>')
+            in_meta_box = False
             continue
 
-        if "晨报 ·" in l and ("<h2>" not in l):
-            html_lines.append(f'<h2>{l}</h2>')
+        # 匹配版块大类: **1. IBMS 智能建筑管理平台**
+        section_match = re.match(r'^\*\*\s*([0-9]\..+?)\s*\*\*$', l)
+        if section_match:
+            html_lines.append(f'<div class="section-header">{section_match.group(1)}</div>')
             continue
 
-        if l.startswith("今日一句话：") or l.startswith("来源："):
-            html_lines.append(f'<div class="meta-box"><p>{l}</p></div>')
+        # 匹配具体条目标题: - **AutomatedBuildings：...** 或 1. **Nvke – ...**
+        item_match = re.match(r'^(?:-\s*)?(?:[0-9]+\.\s*)?\*\*(.+?)\*\*$', l)
+        if item_match and not l.startswith('**[0-9]'):
+            html_lines.append(f'<div class="item-title">• {item_match.group(1)}</div>')
             continue
 
-        if re.match(r'^[1-9]\.\s+', l):
-            if in_card:
-                html_lines.append('</div>')
-                in_card = False
-            html_lines.append(f'<div class="section-header">{l}</div>')
-            continue
-
-        if any(keyword in l for keyword in ["摘要：", "为什么值得看：", "点数：", "链接："]):
-            l = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'<a href="\2">\1</a>', l)
-            l = re.sub(r'\*\*([^\*]+)\*\*', r'<strong>\1</strong>', l)
-            html_lines.append(f'<p class="item-field">{l}</p>')
-            continue
-
+        # 匹配固定栏目: 模型官方博客速览, 开源与社区速览, 口径说明
         if any(h in l for h in ["模型官方博客速览", "开源与社区速览", "口径说明", "和你相关的"]):
-            if in_card:
-                html_lines.append('</div>')
-                in_card = False
             html_lines.append(f'<div class="sub-header">{l}</div>')
             continue
 
-        l = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'<a href="\2">\1</a>', l)
+        # 处理正文加粗
         l = re.sub(r'\*\*([^\*]+)\*\*', r'<strong>\1</strong>', l)
+
+        # 处理链接: 链接: https://...
+        link_match = re.search(r'(https?://[^\s\)]+)', l)
+        if link_match:
+            raw_url = link_match.group(1)
+            l = re.sub(r'https?://[^\s\)]+', f'<a href="{raw_url}">{raw_url}</a>', l)
+            html_lines.append(f'<p class="source-link">{l}</p>')
+            continue
+
         html_lines.append(f'<p>{l}</p>')
 
-    if in_card:
+    if in_meta_box:
         html_lines.append('</div>')
 
     joined = "\n".join(html_lines)
     return clean_xml_and_urls(joined)
 
-print("\n正在生成【智能建筑资讯晨报】...")
-prompt_building = f"""
-今天是 {date_str}（{weekday_str}）。请检索过去 24 小时内关于“智能建筑、IBMS、综合能源管理、楼宇自控、建筑 AI 节能”的最新动态，严格按以下格式输出：
-
-智能建筑资讯晨报 · {date_str}（{weekday_str}）
-来源：过去约 24 小时公开资讯，覆盖 IBMS、综合能源管理、相关 AI 与预防性维护策略/引擎。
-今日一句话：（提炼今日最关键的行业核心洞察）
-
-1. IBMS 智能建筑管理平台
-（整理最新更新，若无重大更新注明未检索到）
-
-2. 综合能源管理平台
-（整理项目进展，含技术亮点、为什么值得看与链接）
-
-3. 智能建筑相关 AI
-（详细整理具体落地案例与研讨，包含为什么值得看与链接）
-
-4. 预防性维护策略/引擎
-（整理设备故障诊断动态，若无注明）
-
-5. 其他值得看的
-（建筑创新成果，包含为什么值得看与链接）
-
-口径说明：（简要说明检索时间窗口及去重标准）
-"""
-raw_building = call_gemini(prompt_building)
-content_building = format_to_html(raw_building)
-
-print("正在生成【AI 晨报】...")
-prompt_ai = f"""
-今天是 {date_str}（{weekday_str}）。请检索过去 24 小时内权威科技动态，严格按以下结构输出《AI 晨报》：
-
-AI 晨报 · {date_str}（{weekday_str}）
-来源：Hacker News 首页及 HN 热议链接 + 各大模型官方博客 + 开源社区，权威科技媒体作交叉核验，覆盖过去约 24 小时。
-今日一句话：（提炼今日行业暗线与核心大事件）
-
-（输出 4~6 条 Hacker News 首页深度热点，每条格式如下）：
-条目标题
-摘要：（核心事实、技术原理）
-为什么值得看：（深度洞察与行业启示）
-点数：（点数 / 评论数快照）
-链接：[链接文本](真实原文URL)
-
-和你相关的 1 条：（精选 1 条关于 Claude Code、Agent 实战热点）
-摘要：...
-为什么值得看：...
-点数：...
-链接：...
-
-模型官方博客速览
-（整理 OpenAI、Anthropic、Google 等大厂官方博客动态）
-
-开源与社区速览
-（整理 2 个 GitHub Trending 上的顶级开源项目，标注定位、Star 数、开源协议及链接）
-
-口径说明：（说明快照时间与去重准则）
-"""
-raw_ai = call_gemini(prompt_ai)
-content_ai = format_to_html(raw_ai)
+content_building = format_to_html(content_building_raw)
+content_ai = format_to_html(content_ai_raw)
 
 CSS_STYLE = """
 @charset "utf-8";
@@ -255,6 +233,13 @@ h2 {
     padding-left: 8px;
     border-left: 4px solid #333;
 }
+.item-title {
+    font-size: 1.08em;
+    font-weight: bold;
+    margin-top: 1.0em;
+    margin-bottom: 0.3em;
+    color: #111;
+}
 .sub-header {
     font-size: 1.15em;
     font-weight: bold;
@@ -273,9 +258,11 @@ h2 {
 .meta-box p {
     margin: 4px 0;
 }
-p.item-field {
-    margin: 5px 0;
-    text-indent: 0;
+.source-link {
+    font-size: 0.88em;
+    color: #444;
+    word-break: break-all;
+    margin: 4px 0 12px 0;
 }
 p {
     margin: 6px 0;
@@ -305,7 +292,7 @@ with zipfile.ZipFile(epub_file, 'w', zipfile.ZIP_DEFLATED) as z:
 <package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId" version="2.0">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
     <dc:title>每日精选资讯合订本 ({date_str})</dc:title>
-    <dc:creator>AI 定时晨报</dc:creator>
+    <dc:creator>Muse 定时晨报</dc:creator>
     <dc:language>zh-CN</dc:language>
     <dc:date>{date_str}</dc:date>
     <dc:identifier id="BookId">urn:uuid:dailynews-{date_str}</dc:identifier>
@@ -363,7 +350,7 @@ with zipfile.ZipFile(epub_file, 'w', zipfile.ZIP_DEFLATED) as z:
 </head>
 <body>
   <h1 class="book-title">每日精选资讯合订本</h1>
-  <p class="book-subtitle">专属定制晨报</p>
+  <p class="book-subtitle">MUSE 专属定制晨报</p>
   <p class="cover-date">{date_str} · {weekday_str}</p>
   
   <div style="margin-top: 30%; border-top: 1px solid #777; padding-top: 15px;">
