@@ -19,37 +19,62 @@ if not api_key:
     print("错误：未找到 GEMINI_API_KEY 环境变量！")
     sys.exit(1)
 
+# 第一步：直接向 Google 查询当前账号允许使用的所有模型
+print("正在自动查询 Google AI Studio 允许调用的模型列表...")
+list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+list_resp = requests.get(list_url, timeout=30)
+
+if list_resp.status_code != 200:
+    print(f"【API Key 验证失败】({list_resp.status_code}): {list_resp.text}")
+    sys.exit(1)
+
+available_models = []
+for m in list_resp.json().get("models", []):
+    methods = m.get("supportedGenerationMethods", [])
+    if "generateContent" in methods:
+        available_models.append(m.get("name"))
+
+print(f"【成功获取可用模型】共 {len(available_models)} 个模型:")
+for m in available_models[:8]:
+    print("  -", m)
+
+# 优选包含 flash 的最新模型
+target_model = None
+for pref in ["models/gemini-3.8-flash", "models/gemini-2.0-flash", "models/gemini-flash-latest"]:
+    if pref in available_models:
+        target_model = pref
+        break
+
+if not target_model and available_models:
+    target_model = available_models[0]
+
+print(f"\n>>> 自动锁定目标模型: 【{target_model}】 <<<")
+
 def call_gemini(prompt):
-    # 使用 Google 官方推荐的最新主力模型 gemini-3.8-flash
-    models = ["gemini-3.8-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-    last_err = None
-
-    for m in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={api_key}"
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "tools": [{"googleSearch": {}}],
-            "generationConfig": {
-                "temperature": 0.2
-            }
+    url = f"https://generativelanguage.googleapis.com/v1beta/{target_model}:generateContent?key={api_key}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {
+            "temperature": 0.2
         }
-        headers = {"Content-Type": "application/json"}
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=120)
-            if resp.status_code == 200:
-                data = resp.json()
-                parts = data["candidates"][0]["content"]["parts"]
-                return "".join([p.get("text", "") for p in parts])
-            else:
-                last_err = f"{m} ({resp.status_code}): {resp.text}"
-                print(f"尝试模型 {m} 遇到问题，尝试备用模型...")
-        except Exception as e:
-            last_err = str(e)
-            continue
+    }
+    headers = {"Content-Type": "application/json"}
+    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+    
+    # 如果带 search tool 失败，降级尝试无 search 纯模型，并打印原因
+    if resp.status_code != 200:
+        print(f"带联网搜索调用失败 ({resp.status_code}): {resp.text}")
+        print("尝试降级调用 (不带 tools)...")
+        payload.pop("tools", None)
+        resp = requests.post(url, headers=headers, json=payload, timeout=120)
+        if resp.status_code != 200:
+            raise Exception(f"模型调用失败 ({resp.status_code}): {resp.text}")
 
-    raise Exception(f"所有 Gemini 模型调用均失败！错误详情：\n{last_err}")
+    data = resp.json()
+    parts = data["candidates"][0]["content"]["parts"]
+    return "".join([p.get("text", "") for p in parts])
 
-# 清洗 Meta 重定向链接与 XML 特殊符号
 def clean_xml_and_urls(text):
     def unwrap_meta(match):
         full_url = match.group(1)
@@ -61,7 +86,6 @@ def clean_xml_and_urls(text):
         return f'href="{full_url}"'
 
     text = re.sub(r'href="([^"]+)"', unwrap_meta, text)
-    # 转义未转义的 & 符号，防止 XHTML 解析崩溃
     text = re.sub(r'&(?!(amp|lt|gt|quot|apos);)', '&amp;', text)
     return text
 
@@ -126,40 +150,37 @@ def format_to_html(raw_text):
     joined = "\n".join(html_lines)
     return clean_xml_and_urls(joined)
 
-print("正在生成【智能建筑资讯晨报】(严格对齐 5 大板块口径)...")
+print("\n正在生成【智能建筑资讯晨报】...")
 prompt_building = f"""
-今天是 {date_str}（{weekday_str}）。请利用实时 Google 搜索，严格按照以下口径检索并撰写过去 24 小时内的《智能建筑资讯晨报》：
-
-覆盖范围：IBMS、综合能源管理、建筑相关 AI 与预防性维护策略/引擎、戴森大奖等建筑边缘创新。
-必须严格按以下结构输出，严谨核实发布日期、技术细节和节能数据：
+今天是 {date_str}（{weekday_str}）。请检索过去 24 小时内关于“智能建筑、IBMS、综合能源管理、楼宇自控、建筑 AI 节能”的最新动态，严格按以下格式输出：
 
 智能建筑资讯晨报 · {date_str}（{weekday_str}）
 来源：过去约 24 小时公开资讯，覆盖 IBMS、综合能源管理、相关 AI 与预防性维护策略/引擎。
-今日一句话：（提炼今日最关键的行业核心趋势与洞察）
+今日一句话：（提炼今日最关键的行业核心洞察）
 
 1. IBMS 智能建筑管理平台
-（整理实质性更新，若无重大更新则明确注明未检索到）
+（整理最新更新，若无重大更新注明未检索到）
 
 2. 综合能源管理平台
-（整理发电侧/用电侧预测、储能优化、冷机控制等项目进展，含项目主体、合作模式、技术亮点及为什么值得看、真实原文链接）
+（整理项目进展，含技术亮点、为什么值得看与链接）
 
 3. 智能建筑相关 AI
-（详细整理具体落地案例或前沿研讨，如楼宇自主化治理、能耗预测、闭环控制等，包含为什么值得看与链接）
+（详细整理具体落地案例与研讨，包含为什么值得看与链接）
 
 4. 预防性维护策略/引擎
-（整理设备故障诊断、传感器算法与引擎产品动态，若无则注明）
+（整理设备故障诊断动态，若无注明）
 
 5. 其他值得看的
-（建筑新材料、低成本结构监测、戴森奖等突破性边缘创新，包含为什么值得看与链接）
+（建筑创新成果，包含为什么值得看与链接）
 
 口径说明：（简要说明检索时间窗口及去重标准）
 """
 raw_building = call_gemini(prompt_building)
 content_building = format_to_html(raw_building)
 
-print("正在生成【AI 晨报】(严格对齐 HN、大模型官方与开源社区口径)...")
+print("正在生成【AI 晨报】...")
 prompt_ai = f"""
-今天是 {date_str}（{weekday_str}）。请利用实时 Google 搜索，检索过去 24 小时内权威科技动态，严格按照以下结构输出《AI 晨报》：
+今天是 {date_str}（{weekday_str}）。请检索过去 24 小时内权威科技动态，严格按以下结构输出《AI 晨报》：
 
 AI 晨报 · {date_str}（{weekday_str}）
 来源：Hacker News 首页及 HN 热议链接 + 各大模型官方博客 + 开源社区，权威科技媒体作交叉核验，覆盖过去约 24 小时。
@@ -167,24 +188,24 @@ AI 晨报 · {date_str}（{weekday_str}）
 
 （输出 4~6 条 Hacker News 首页深度热点，每条格式如下）：
 条目标题
-摘要：（核心事实、技术原理或事件来龙去脉）
+摘要：（核心事实、技术原理）
 为什么值得看：（深度洞察与行业启示）
 点数：（点数 / 评论数快照）
 链接：[链接文本](真实原文URL)
 
-和你相关的 1 条：（精选 1 条关于 Claude Code、Cursor、开发 Agent 或安全防范的实战攻坚热点）
+和你相关的 1 条：（精选 1 条关于 Claude Code、Agent 实战热点）
 摘要：...
 为什么值得看：...
 点数：...
 链接：...
 
 模型官方博客速览
-（分别整理 OpenAI、Anthropic、Google、开源社区等大厂官方博客的最新更新，若无更新简要说明）
+（整理 OpenAI、Anthropic、Google 等大厂官方博客动态）
 
 开源与社区速览
-（整理 2 个当前 GitHub Trending 上的顶级开源项目，标注项目定位、Star 数、开源协议、为什么值得看及链接）
+（整理 2 个 GitHub Trending 上的顶级开源项目，标注定位、Star 数、开源协议及链接）
 
-口径说明：（说明 HN 点数快照时间与去重准则）
+口径说明：（说明快照时间与去重准则）
 """
 raw_ai = call_gemini(prompt_ai)
 content_ai = format_to_html(raw_ai)
@@ -377,4 +398,4 @@ with zipfile.ZipFile(epub_file, 'w', zipfile.ZIP_DEFLATED) as z:
 </body>
 </html>''')
 
-print("合订本编译完成！")
+print("精装合订本编译完成！")
